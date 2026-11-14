@@ -37,7 +37,8 @@ static std::map<QString, QString> loadScripts(const QString &dir,
 Translator::Translator(Manager &manager, const Settings &settings)
   : manager_(manager)
   , settings_(settings)
-  , view_(nullptr)
+  , viewSlot_(new QWidget(this))
+  , viewSlotLayout_(new QVBoxLayout(viewSlot_))
   , url_(new QLineEdit(this))
   , loadImages_(
         new QAction(QIcon(":/icons/loadImages.png"), tr("Load images"), this))
@@ -57,7 +58,8 @@ Translator::Translator(Manager &manager, const Settings &settings)
   setObjectName("Translator");
   setWindowTitle(tr("Translator"));
 
-  view_ = new QWebEngineView(this);
+  viewSlotLayout_->setContentsMargins(0, 0, 0, 0);
+  viewSlot_->setMinimumSize(200, 200);
 
   auto detailsFrame = new QWidget(this);
   {
@@ -73,7 +75,7 @@ Translator::Translator(Manager &manager, const Settings &settings)
   }
 
   auto splitter = new QSplitter(Qt::Vertical, this);
-  splitter->addWidget(view_);
+  splitter->addWidget(viewSlot_);
   splitter->addWidget(detailsFrame);
 
   auto layout = new QVBoxLayout(this);
@@ -92,12 +94,15 @@ Translator::Translator(Manager &manager, const Settings &settings)
   connect(tabs_, &QTabWidget::currentChanged,  //
           this, &Translator::udpateCurrentPage);
 
-  view_->setMinimumSize(200, 200);
-
   new service::WidgetState(this);
 }
 
-Translator::~Translator() = default;
+Translator::~Translator()
+{
+  detachPageView();
+  delete renderHost_;
+  renderHost_ = nullptr;
+}
 
 void Translator::translate(const TaskPtr &task)
 {
@@ -115,7 +120,12 @@ void Translator::translate(const TaskPtr &task)
 
 void Translator::updateSettings()
 {
-  view_->setPage(nullptr);
+  detachPageView();
+
+  for (auto &i : pageViews_)
+    delete i.second;
+  pageViews_.clear();
+
   pages_.clear();
   queue_.clear();
   url_->clear();
@@ -146,7 +156,8 @@ void Translator::updateSettings()
 void Translator::createPage(const QString &scriptName,
                             const QString &scriptText)
 {
-  pages_.erase(scriptName);
+  destroyPage(scriptName);
+
   const auto pageIt = pages_.emplace(
       scriptName, std::make_unique<WebPage>(*this, scriptText, scriptName));
   SOFT_ASSERT(pageIt.second, return );
@@ -154,12 +165,16 @@ void Translator::createPage(const QString &scriptName,
   const auto &page = pageIt.first->second;
   page->setIgnoreSslErrors(settings_.ignoreSslErrors);
   page->setTimeout(settings_.translationTimeout);
-  page->setVisible(true);
-  connect(page.get(), &WebPage::visibleChanged,  //
-          page.get(), [page = page.get()](bool on) {
-            if (!on)
-              page->setVisible(true);
-          });
+
+  // The page is hosted by a permanently "shown" view in the off-screen
+  // window, so that it keeps working when the translator window is closed.
+  ensureRenderHost();
+
+  auto *pageView = new QWebEngineView(renderHost_);
+  pageView->setPage(page.get());
+  pageView->resize(800, 600);
+  pageView->show();
+  pageViews_[scriptName] = pageView;
 
   auto log = new QTextEdit(tabs_);
   tabs_->addTab(log, scriptName);
@@ -179,6 +194,79 @@ void Translator::createPage(const QString &scriptName,
   SOFT_ASSERT(log->document(), return )
   log->document()->setMaximumBlockCount(1000);
   LTRACE() << "Created page" << LARG(scriptName);
+}
+
+void Translator::destroyPage(const QString &scriptName)
+{
+  if (shownPageName_ == scriptName)
+    detachPageView();
+
+  const auto viewIt = pageViews_.find(scriptName);
+  if (viewIt != pageViews_.end()) {
+    delete viewIt->second;
+    pageViews_.erase(viewIt);
+  }
+
+  pages_.erase(scriptName);
+}
+
+void Translator::ensureRenderHost()
+{
+  if (renderHost_)
+    return;
+
+  // The host window is needed only to keep the page views "visible" for
+  // QtWebEngine. Without a visible view the engine stops updating the page
+  // and the translator site never produces a result.
+  //
+  // WA_DontShowOnScreen makes Qt treat the window as shown while it is
+  // never displayed on the screen, so it cannot disturb the user and
+  // cannot be closed by accident.
+  renderHost_ = new QWidget;
+  renderHost_->setWindowTitle(tr("ScreenTranslator"));
+  renderHost_->setWindowFlags(Qt::Tool | Qt::WindowDoesNotAcceptFocus);
+  renderHost_->setAttribute(Qt::WA_DontShowOnScreen, true);
+  renderHost_->setAttribute(Qt::WA_ShowWithoutActivating, true);
+  renderHost_->resize(800, 600);
+  renderHost_->show();
+}
+
+void Translator::attachPageView(WebPage *page)
+{
+  if (!page || !renderHost_)
+    return;
+
+  const auto name = page->scriptName();
+  const auto it = pageViews_.find(name);
+  if (it == pageViews_.end())
+    return;
+
+  if (shownPageName_ == name)
+    return;
+
+  detachPageView();
+
+  auto *pageView = it->second;
+  pageView->setParent(viewSlot_);
+  viewSlotLayout_->addWidget(pageView);
+  pageView->show();
+  shownPageName_ = name;
+}
+
+void Translator::detachPageView()
+{
+  if (shownPageName_.isEmpty())
+    return;
+
+  const auto it = pageViews_.find(shownPageName_);
+  if (it != pageViews_.end()) {
+    auto *pageView = it->second;
+    viewSlotLayout_->removeWidget(pageView);
+    pageView->setParent(renderHost_);
+    pageView->show();
+  }
+
+  shownPageName_.clear();
 }
 
 void Translator::showDebugView()
@@ -209,7 +297,9 @@ void Translator::udpateCurrentPage()
   if (!page)
     return;
 
-  view_->setPage(page);
+  if (isVisible())
+    attachPageView(page);
+
   QSignalBlocker blocker(loadImages_);
   loadImages_->setChecked(page->isLoadImages());
   url_->setText(page->url().toString());
@@ -233,6 +323,18 @@ void Translator::setPageLoadImages(bool isOn)
   page->setLoadImages(isOn);
 }
 
+void Translator::showEvent(QShowEvent *event)
+{
+  QWidget::showEvent(event);
+  attachPageView(currentPage());
+}
+
+void Translator::hideEvent(QHideEvent *event)
+{
+  detachPageView();
+  QWidget::hideEvent(event);
+}
+
 void Translator::processQueue()
 {
   if (queue_.empty())
@@ -241,19 +343,13 @@ void Translator::processQueue()
   std::unordered_set<QString> idlePages;
   std::unordered_set<Task *> busyTasks;
 
-  auto oldPage = view_->page();
   for (auto &i : pages_) {
     if (!i.second->checkBusy()) {
       idlePages.insert(i.first);
     } else {
       busyTasks.insert(i.second->task().get());
-      view_->setPage(i.second.get());
-      view_->update();
     }
   }
-
-  if (oldPage != view_->page())
-    view_->setPage(oldPage);
 
   if (idlePages.empty())
     return;

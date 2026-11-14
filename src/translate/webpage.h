@@ -27,6 +27,8 @@ public:
   bool isLoadImages() const;
   void setLoadImages(bool isOn);
 
+  const QString &scriptName() const;
+
 signals:
   void log(const QString &text);
 

@@ -163,6 +163,11 @@ void WebPage::setFailed(const QString &error)
   addErrorToTask(error);
 }
 
+const QString &WebPage::scriptName() const
+{
+  return scriptName_;
+}
+
 TaskPtr WebPage::task() const
 {
   return task_;
